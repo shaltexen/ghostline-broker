@@ -1,0 +1,15 @@
+# Render blueprint for the GHOSTLINE broker.
+# If you deploy the WHOLE ghostline repo, set the service's Root Directory to
+# "broker" in the Render UI (or add `rootDir: broker` below). If you deploy the
+# broker/ folder as its own repo, this works as-is.
+services:
+  - type: web
+    name: ghostline-broker
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /gl/health
+    envVars:
+      - key: NODE_VERSION
+        value: "20"

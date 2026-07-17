@@ -1,0 +1,32 @@
+/* ============ GHOSTLINE handshake broker ============
+   A tiny PeerJS PeerServer. It ONLY brokers the initial handshake between two
+   peers (exchanging connection info) — it never sees your messages or calls,
+   which stay end-to-end encrypted and peer-to-peer.
+
+   Run locally:      npm install && npm start
+   Deploy free on:   Render / Railway / Fly.io / Glitch  (see README.md)
+
+   Then in the app → ⚙ Settings → broker (or "set your broker" on the sign-in
+   screen), enter:
+     HOST = your broker's hostname     (e.g. ghostline-broker.onrender.com)
+     PORT = 443                        (hosted / https)  ·  9000 (local http)
+     PATH = /ghostline
+     KEY  = peerjs
+*/
+const { PeerServer } = require("peer");
+
+const PORT = process.env.PORT || 9000;
+
+const server = PeerServer(
+  {
+    port: PORT,
+    path: "/ghostline",
+    key: "peerjs",
+    allow_discovery: true,
+    proxied: true, // correct client IPs behind a hosting TLS proxy (Render/Railway/etc.)
+  },
+  () => console.log(`GHOSTLINE broker listening on :${PORT}  (path /ghostline)`)
+);
+
+server.on("connection", (c) => console.log("＋ peer:", c.getId()));
+server.on("disconnect", (c) => console.log("－ peer:", c.getId()));

@@ -1,0 +1,4 @@
+node_modules/
+*.log
+gl-data.json
+.DS_Store
