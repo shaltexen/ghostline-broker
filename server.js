@@ -37,6 +37,7 @@ if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) 
     kind: "redis",
     getName: (u) => redis.hget("gl:names", u),
     setName: (u, rec) => redis.hset("gl:names", { [u]: rec }),
+    delName: (u) => redis.hdel("gl:names", u),
     nameCount: () => redis.hlen("gl:names"),
     async pushInbox(u, item) { const k = IKEY(u); await redis.rpush(k, item); await redis.ltrim(k, -MAX_INBOX, -1); await redis.expire(k, INBOX_TTL_S); },
     async fetchClearInbox(u) { const k = IKEY(u); const items = await redis.lrange(k, 0, -1); await redis.del(k); return items || []; },
@@ -53,6 +54,7 @@ if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) 
     kind: "file",
     async getName(u) { return db.names[u] || null; },
     async setName(u, rec) { db.names[u] = rec; save(); },
+    async delName(u) { delete db.names[u]; save(); },
     async nameCount() { return Object.keys(db.names).length; },
     async pushInbox(u, item) { if (!db.inbox[u]) db.inbox[u] = []; if (db.inbox[u].length >= MAX_INBOX) db.inbox[u].shift(); db.inbox[u].push(item); save(); },
     async fetchClearInbox(u) { const now = Date.now(); const msgs = (db.inbox[u] || []).filter((m) => now - m.ts < INBOX_TTL); delete db.inbox[u]; save(); return msgs; },
@@ -115,6 +117,22 @@ app.get("/gl/lookup", async (req, res) => {
   const rec = await store.getName(req.query.u);
   if (!rec) return res.status(404).json({ error: "not found" });
   res.json({ username: req.query.u, jwk: rec.jwk, ecdh: rec.ecdh });
+});
+
+/* release: give up a username you hold so someone else can claim it (the app
+   calls this when you delete your account). Prove you hold the key by signing
+   "release|<username>|<ts>". Idempotent — releasing a free name is a no-op.
+   Also drops any undelivered mail addressed to that name (it'd be undecryptable
+   once your keys are gone anyway). */
+app.post("/gl/release", async (req, res) => {
+  const { username, sig, ts } = req.body || {};
+  if (!username || !sig || !freshTs(ts)) return res.status(400).json({ error: "bad request" });
+  const rec = await store.getName(username);
+  if (!rec) return res.json({ ok: true, released: username }); // already free
+  if (!await verifySig(rec.jwk, sig, "release|" + username + "|" + ts)) return res.status(403).json({ error: "bad signature" });
+  await store.delName(username);
+  await store.fetchClearInbox(username); // discard any pending mail for the gone account
+  res.json({ ok: true, released: username });
 });
 
 /* ---- offline mailbox (store-and-forward of E2E-encrypted blobs) ----
