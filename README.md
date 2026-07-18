@@ -24,8 +24,10 @@ Then **Save & reload** and sign in. Everyone who chats together must use the **s
 Besides PeerJS signaling (`/ghostline`, key `peerjs` — unchanged), it now runs two small
 opt-in services under `/gl`, which is why it depends on **express** (installed by `npm install`):
 
-- **Username reservation** (`/gl/claim`, `/gl/lookup`) — binds a username to your identity
-  key so nobody can take it while you're offline. The broker stores only `username → public key`.
+- **Username reservation** (`/gl/claim`, `/gl/lookup`, `/gl/release`) — binds a username to your
+  identity key so nobody can take it while you're offline. The broker stores only `username → public
+  key`. Deleting your account calls `/gl/release` (a signed request proving you hold the key), which
+  frees the name so someone else can claim it.
 - **Offline mailbox** (`/gl/outbox`, `/gl/inbox`) — holds **end-to-end-encrypted** messages for
   a recipient until they reconnect. The broker **cannot read them** — it only stores/forwards
   opaque ciphertext, and clears each mailbox the moment its owner fetches it.
