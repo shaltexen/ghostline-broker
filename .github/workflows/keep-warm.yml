@@ -1,0 +1,24 @@
+# Keeps the free-plan Render broker awake so there are no ~50s cold starts.
+# Pings the health endpoint every ~10 min. Free, runs on GitHub's servers.
+# (GitHub may disable scheduled workflows after 60 days of no repo activity —
+#  just re-enable it in the Actions tab if that happens.)
+name: keep-broker-warm
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # every 10 minutes (under Render's 15-min sleep threshold)
+  workflow_dispatch:          # lets you run it manually from the Actions tab
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping broker health
+        run: |
+          URL="https://ghostline-broker.onrender.com/gl/health"
+          for i in 1 2 3 4; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 70 "$URL") || code="000"
+            if [ "$code" = "200" ]; then echo "broker warm (HTTP $code)"; exit 0; fi
+            echo "attempt $i: HTTP $code — waking, retrying in 20s"; sleep 20
+          done
+          echo "broker did not return 200 after retries"; exit 1

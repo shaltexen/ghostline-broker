@@ -30,9 +30,33 @@ opt-in services under `/gl`, which is why it depends on **express** (installed b
   a recipient until they reconnect. The broker **cannot read them** — it only stores/forwards
   opaque ciphertext, and clears each mailbox the moment its owner fetches it.
 
-State lives in `gl-data.json` next to the server (set `GL_DATA` to move it). Deleting that file
-resets all reservations and pending mail. These services need no client setup — the app uses them
-automatically when the broker supports them, and silently skips them when it doesn't.
+By default state lives in `gl-data.json` next to the server. These services need no client setup —
+the app uses them automatically when the broker supports them, and silently skips them when it doesn't.
+
+---
+
+## Keeping it reliable on Render's free plan
+
+The free plan has two quirks. Both are optional to fix; messaging and pairing work regardless.
+
+### 1. Durable state (survive restarts) — Upstash Redis
+
+Render's free plan has **no persistent disk**, so `gl-data.json` (reservations + offline mail) is
+wiped on every redeploy/restart. Point the broker at a free Upstash Redis instead and it persists:
+
+1. Create a free database at **upstash.com** → Redis → Create Database (any region).
+2. On its page, copy **UPSTASH_REDIS_REST_URL** and **UPSTASH_REDIS_REST_TOKEN**.
+3. In Render → your service → **Environment** → add those two env vars → save (it redeploys).
+
+The broker auto-detects them (`state: Upstash Redis (durable)` in the logs) and falls back to the
+file when they're absent — so local runs need nothing. Mailbox entries expire after 14 days.
+
+### 2. No cold starts — keep-warm ping
+
+The free plan sleeps the service after ~15 min idle (~50s to wake). The included GitHub Action
+(`.github/workflows/keep-warm.yml`) pings `/gl/health` every 10 minutes to keep it awake — free,
+no extra account. It activates once the broker repo is on GitHub with Actions enabled. Alternatively
+a free scheduler like **cron-job.org** hitting the same URL works too.
 
 ---
 

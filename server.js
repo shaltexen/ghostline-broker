@@ -20,14 +20,45 @@ const PORT = process.env.PORT || 9000;
 const DATA = process.env.GL_DATA || path.join(__dirname, "gl-data.json");
 const MAX_BLOB = 200 * 1024;        // max size of one offline message blob
 const MAX_INBOX = 200;              // max queued messages per recipient
-const INBOX_TTL = 14 * 24 * 3600e3; // drop undelivered mail after 14 days
+const INBOX_TTL = 14 * 24 * 3600e3; // drop undelivered mail after 14 days (ms)
+const INBOX_TTL_S = 14 * 24 * 3600; // ...and in seconds (Redis EXPIRE)
 
-let db = { names: {}, inbox: {} };
-try { db = JSON.parse(fs.readFileSync(DATA, "utf8")); } catch {}
-if (!db.names) db.names = {};
-if (!db.inbox) db.inbox = {};
-let saveTimer = null;
-function save() { clearTimeout(saveTimer); saveTimer = setTimeout(() => { try { fs.writeFileSync(DATA, JSON.stringify(db)); } catch (e) { console.error("save failed", e.message); } }, 400); }
+/* ---- state store ----
+   Set UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN and reservations + offline
+   mail persist across restarts/redeploys (needed on hosts with no persistent disk,
+   like Render's free plan). Without them it falls back to a local JSON file — fine
+   for a VPS/local run. Nothing else in the app changes either way. */
+let store;
+if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) {
+  const { Redis } = require("@upstash/redis");
+  const redis = Redis.fromEnv();
+  const IKEY = (u) => "gl:inbox:" + u;
+  store = {
+    kind: "redis",
+    getName: (u) => redis.hget("gl:names", u),
+    setName: (u, rec) => redis.hset("gl:names", { [u]: rec }),
+    nameCount: () => redis.hlen("gl:names"),
+    async pushInbox(u, item) { const k = IKEY(u); await redis.rpush(k, item); await redis.ltrim(k, -MAX_INBOX, -1); await redis.expire(k, INBOX_TTL_S); },
+    async fetchClearInbox(u) { const k = IKEY(u); const items = await redis.lrange(k, 0, -1); await redis.del(k); return items || []; },
+  };
+  console.log("state: Upstash Redis (durable)");
+} else {
+  let db = { names: {}, inbox: {} };
+  try { db = JSON.parse(fs.readFileSync(DATA, "utf8")); } catch {}
+  if (!db.names) db.names = {};
+  if (!db.inbox) db.inbox = {};
+  let saveTimer = null;
+  const save = () => { clearTimeout(saveTimer); saveTimer = setTimeout(() => { try { fs.writeFileSync(DATA, JSON.stringify(db)); } catch (e) { console.error("save failed", e.message); } }, 400); };
+  store = {
+    kind: "file",
+    async getName(u) { return db.names[u] || null; },
+    async setName(u, rec) { db.names[u] = rec; save(); },
+    async nameCount() { return Object.keys(db.names).length; },
+    async pushInbox(u, item) { if (!db.inbox[u]) db.inbox[u] = []; if (db.inbox[u].length >= MAX_INBOX) db.inbox[u].shift(); db.inbox[u].push(item); save(); },
+    async fetchClearInbox(u) { const now = Date.now(); const msgs = (db.inbox[u] || []).filter((m) => now - m.ts < INBOX_TTL); delete db.inbox[u]; save(); return msgs; },
+  };
+  console.log("state: local file " + DATA + "  (set UPSTASH_REDIS_REST_URL/TOKEN for durable storage)");
+}
 
 const b64 = (buf) => Buffer.from(buf).toString("base64");
 const unb64 = (s) => new Uint8Array(Buffer.from(s, "base64"));
@@ -73,16 +104,15 @@ app.post("/gl/claim", async (req, res) => {
   if (!username || !jwk || !sig || !freshTs(ts)) return res.status(400).json({ error: "bad request" });
   if (!await verifySig(jwk, sig, "claim|" + username + "|" + ts)) return res.status(403).json({ error: "bad signature" });
   const fp = await fpOf(jwk);
-  const cur = db.names[username];
+  const cur = await store.getName(username);
   if (cur && cur.fp !== fp) return res.status(409).json({ error: "taken", takenBy: "another key" });
-  db.names[username] = { fp, jwk, ecdh: ecdh || (cur && cur.ecdh) || null, ts: Date.now() };
-  save();
+  await store.setName(username, { fp, jwk, ecdh: ecdh || (cur && cur.ecdh) || null, ts: Date.now() });
   res.json({ ok: true, reserved: username });
 });
 
 // look up a user's public keys (to encrypt offline mail to them)
-app.get("/gl/lookup", (req, res) => {
-  const rec = db.names[req.query.u];
+app.get("/gl/lookup", async (req, res) => {
+  const rec = await store.getName(req.query.u);
   if (!rec) return res.status(404).json({ error: "not found" });
   res.json({ username: req.query.u, jwk: rec.jwk, ecdh: rec.ecdh });
 });
@@ -90,14 +120,11 @@ app.get("/gl/lookup", (req, res) => {
 /* ---- offline mailbox (store-and-forward of E2E-encrypted blobs) ----
    send: anyone may drop a blob addressed to <to> (recipients verify the sender
    cryptographically on their end). The broker never sees plaintext. */
-app.post("/gl/outbox", (req, res) => {
+app.post("/gl/outbox", async (req, res) => {
   const { to, env } = req.body || {};
   if (!to || !env || typeof env !== "object") return res.status(400).json({ error: "bad request" });
   if (JSON.stringify(env).length > MAX_BLOB) return res.status(413).json({ error: "too large" });
-  if (!db.inbox[to]) db.inbox[to] = [];
-  if (db.inbox[to].length >= MAX_INBOX) db.inbox[to].shift();
-  db.inbox[to].push({ env, ts: Date.now() });
-  save();
+  await store.pushInbox(to, { env, ts: Date.now() });
   res.json({ ok: true });
 });
 
@@ -105,16 +132,10 @@ app.post("/gl/outbox", (req, res) => {
 app.post("/gl/inbox", async (req, res) => {
   const { username, sig, ts } = req.body || {};
   if (!username || !sig || !freshTs(ts)) return res.status(400).json({ error: "bad request" });
-  const rec = db.names[username];
+  const rec = await store.getName(username);
   if (!rec) return res.json({ messages: [] }); // no reservation → nothing addressed here
   if (!await verifySig(rec.jwk, sig, "inbox|" + username + "|" + ts)) return res.status(403).json({ error: "bad signature" });
-  const now = Date.now();
-  const msgs = (db.inbox[username] || []).filter((m) => now - m.ts < INBOX_TTL);
-  delete db.inbox[username];
-  save();
-  res.json({ messages: msgs });
+  res.json({ messages: await store.fetchClearInbox(username) });
 });
 
-app.get("/gl/health", (_req, res) => res.json({ ok: true, names: Object.keys(db.names).length }));
-
-process.on("SIGINT", () => { try { fs.writeFileSync(DATA, JSON.stringify(db)); } catch {} process.exit(0); });
+app.get("/gl/health", async (_req, res) => res.json({ ok: true, store: store.kind, names: await store.nameCount() }));
