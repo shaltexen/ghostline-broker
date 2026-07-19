@@ -79,7 +79,9 @@ async function verifySig(jwk, sigB64, msg) {
 function freshTs(ts) { return typeof ts === "number" && Math.abs(Date.now() - ts) < 5 * 60e3; }
 
 const app = express();
-app.use(express.json({ limit: "600kb" }));
+// 8mb so device-pairing account bundles (E2E-encrypted, incl. avatars) fit;
+// every route still validates/caps its own payload (outbox uses MAX_BLOB)
+app.use(express.json({ limit: "8mb" }));
 // the web app calls these cross-origin (through the tunnel), so allow CORS
 app.use((req, res, next) => {
   res.set("Access-Control-Allow-Origin", "*");
@@ -154,6 +156,42 @@ app.post("/gl/inbox", async (req, res) => {
   if (!rec) return res.json({ messages: [] }); // no reservation → nothing addressed here
   if (!await verifySig(rec.jwk, sig, "inbox|" + username + "|" + ts)) return res.status(403).json({ error: "bad signature" });
   res.json({ messages: await store.fetchClearInbox(username) });
+});
+
+/* ---- device-pairing relay ----
+   Plain HTTPS message drop between the two devices being linked — no WebRTC,
+   no TURN, works through any NAT. The broker only ever sees ciphertext: the
+   account bundle is AES-GCM-encrypted with the one-time key inside the QR,
+   which never touches the server. Sessions are short-lived and in-memory. */
+const pairSessions = new Map(); // sess -> { host: [], guest: [], ts }
+const PAIR_TTL = 10 * 60e3;
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of pairSessions) if (now - v.ts > PAIR_TTL) pairSessions.delete(k);
+}, 60e3).unref();
+
+app.post("/gl/pair/send", (req, res) => {
+  const { sess, to, msg } = req.body || {};
+  if (typeof sess !== "string" || sess.length < 8 || sess.length > 64) return res.status(400).json({ error: "bad session" });
+  if (!["host", "guest"].includes(to) || !msg || typeof msg !== "object") return res.status(400).json({ error: "bad request" });
+  let s = pairSessions.get(sess);
+  if (!s) {
+    if (pairSessions.size > 500) return res.status(429).json({ error: "busy" });
+    s = { host: [], guest: [], ts: Date.now() };
+    pairSessions.set(sess, s);
+  }
+  if (s[to].length > 20) return res.status(429).json({ error: "flooded" });
+  s.ts = Date.now();
+  s[to].push(msg);
+  res.json({ ok: true });
+});
+app.get("/gl/pair/recv", (req, res) => {
+  const { sess, role } = req.query;
+  if (!["host", "guest"].includes(role)) return res.status(400).json({ error: "bad role" });
+  const s = pairSessions.get(sess);
+  if (!s) return res.json({ ok: true, msgs: [] });
+  s.ts = Date.now();
+  res.json({ ok: true, msgs: s[role].splice(0) });
 });
 
 app.get("/gl/health", async (_req, res) => res.json({ ok: true, store: store.kind, names: await store.nameCount() }));
