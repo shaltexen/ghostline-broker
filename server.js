@@ -41,16 +41,13 @@ if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) 
     nameCount: () => redis.hlen("gl:names"),
     async pushInbox(u, item) { const k = IKEY(u); await redis.rpush(k, item); await redis.ltrim(k, -MAX_INBOX, -1); await redis.expire(k, INBOX_TTL_S); },
     async fetchClearInbox(u) { const k = IKEY(u); const items = await redis.lrange(k, 0, -1); await redis.del(k); return items || []; },
-    async getConfig() { return (await redis.get("gl:config")) || { announcement: null, flags: {} }; },
-    async setConfig(cfg) { await redis.set("gl:config", cfg); },
   };
   console.log("state: Upstash Redis (durable)");
 } else {
-  let db = { names: {}, inbox: {}, config: null };
+  let db = { names: {}, inbox: {} };
   try { db = JSON.parse(fs.readFileSync(DATA, "utf8")); } catch {}
   if (!db.names) db.names = {};
   if (!db.inbox) db.inbox = {};
-  if (!db.config) db.config = { announcement: null, flags: {} };
   let saveTimer = null;
   const save = () => { clearTimeout(saveTimer); saveTimer = setTimeout(() => { try { fs.writeFileSync(DATA, JSON.stringify(db)); } catch (e) { console.error("save failed", e.message); } }, 400); };
   store = {
@@ -61,8 +58,6 @@ if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) 
     async nameCount() { return Object.keys(db.names).length; },
     async pushInbox(u, item) { if (!db.inbox[u]) db.inbox[u] = []; if (db.inbox[u].length >= MAX_INBOX) db.inbox[u].shift(); db.inbox[u].push(item); save(); },
     async fetchClearInbox(u) { const now = Date.now(); const msgs = (db.inbox[u] || []).filter((m) => now - m.ts < INBOX_TTL); delete db.inbox[u]; save(); return msgs; },
-    async getConfig() { return db.config || { announcement: null, flags: {} }; },
-    async setConfig(cfg) { db.config = cfg; save(); },
   };
   console.log("state: local file " + DATA + "  (set UPSTASH_REDIS_REST_URL/TOKEN for durable storage)");
 }
@@ -199,46 +194,4 @@ app.get("/gl/pair/recv", (req, res) => {
   res.json({ ok: true, msgs: s[role].splice(0) });
 });
 
-/* ---- admin: announcements + feature flags ----
-   The owner controls a small config blob: a broadcast announcement (shown to
-   every client) and feature flags (turn parts of the app on/off for everyone).
-   Reads are public (/gl/motd, clients poll it). Writes (/gl/admin) must be
-   SIGNED by the owner's identity key, and that key's fingerprint must equal the
-   GL_ADMIN_FP env var — so only the owner can push changes, and a leaked env var
-   alone is useless without the private key. Set GL_ADMIN_FP in Render to the
-   fingerprint the app shows you in its Admin panel. */
-const ADMIN_FP = process.env.GL_ADMIN_FP || "";
-async function sha256b64(s) { return b64(await subtle.digest("SHA-256", new TextEncoder().encode(s))); }
-
-// public: every client fetches this on connect + on a timer
-app.get("/gl/motd", async (_req, res) => {
-  const cfg = await store.getConfig();
-  res.json({ ok: true, announcement: cfg.announcement || null, flags: cfg.flags || {} });
-});
-
-// owner-only: set/clear the announcement, set feature flags
-app.post("/gl/admin", async (req, res) => {
-  const { jwk, sig, ts, action, payload } = req.body || {};
-  if (!jwk || !sig || !freshTs(ts) || !action) return res.status(400).json({ error: "bad request" });
-  if (!ADMIN_FP) return res.status(503).json({ error: "admin not configured", hint: "set GL_ADMIN_FP to your owner-key fingerprint (shown in the app's Admin panel)" });
-  const ph = await sha256b64(JSON.stringify(payload || {}));
-  if (!await verifySig(jwk, sig, "admin|" + action + "|" + ts + "|" + ph)) return res.status(403).json({ error: "bad signature" });
-  if (await fpOf(jwk) !== ADMIN_FP) return res.status(403).json({ error: "not admin" });
-  const cfg = await store.getConfig();
-  switch (action) {
-    case "get": break; // just return current config
-    case "set-announcement": {
-      const text = String((payload && payload.text) || "").slice(0, 2000);
-      if (!text) return res.status(400).json({ error: "empty announcement" });
-      cfg.announcement = { text, ts: Date.now(), id: Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8) };
-      break;
-    }
-    case "clear-announcement": cfg.announcement = null; break;
-    case "set-flags": cfg.flags = Object.assign({}, cfg.flags, (payload && payload.flags) || {}); break;
-    default: return res.status(400).json({ error: "unknown action" });
-  }
-  await store.setConfig(cfg);
-  res.json({ ok: true, announcement: cfg.announcement || null, flags: cfg.flags || {} });
-});
-
-app.get("/gl/health", async (_req, res) => res.json({ ok: true, store: store.kind, names: await store.nameCount(), admin: !!ADMIN_FP }));
+app.get("/gl/health", async (_req, res) => res.json({ ok: true, store: store.kind, names: await store.nameCount() }));
